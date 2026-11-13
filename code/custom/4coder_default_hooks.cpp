@@ -13,7 +13,11 @@ CUSTOM_DOC("Default command for responding to a startup event")
         String_Const_u8_Array file_names = input.event.core.file_names;
         load_themes_default_folder(app);
         default_4coder_initialize(app, file_names);
-        default_4coder_side_by_side_panels(app, file_names);
+        Buffer_Identifier start_buffer = buffer_identifier(string_u8_litexpr("*scratch*"));
+        if (file_names.count > 0){
+            start_buffer = buffer_identifier(file_names.vals[0]);
+        }
+        default_4coder_one_panel(app, start_buffer);
         b32 auto_load = def_get_config_b32(vars_save_string_lit("automatically_load_project"));
         if (auto_load){
             load_project(app);
@@ -141,7 +145,16 @@ code_index_update_tick(Application_Links *app){
         // TODO(allen): Actually determine this in a fair way.
         // Maybe switch to an enum?
         // Actually probably a pointer to a struct that defines the language.
-        state.do_cpp_parse = true;
+        Buffer_Language index_language = buffer_get_language(app, buffer_id);
+        if (index_language == BufferLanguage_Python){
+            state.do_python_parse = true;
+        }
+        else if (index_language == BufferLanguage_Go){
+            state.do_go_parse = true;
+        }
+        else{
+            state.do_cpp_parse = true;
+        }
         generic_parse_full_input_breaks(index, &state, max_i32);
         
         code_index_lock();
@@ -687,16 +700,30 @@ do_full_lex_async__inner(Async_Context *actx, Buffer_ID buffer_id){
     Token_List list = {};
     b32 canceled = false;
     
-    Lex_State_Cpp state = {};
-    lex_full_input_cpp_init(&state, contents);
-    for (;;){
-        ProfileBlock(app, "async lex block");
-        if (lex_full_input_cpp_breaks(scratch, &list, &state, limit_factor)){
-            break;
-        }
-        if (async_check_canceled(actx)){
-            canceled = true;
-            break;
+    Buffer_Language language = BufferLanguage_Cpp;
+    {
+        acquire_global_frame_mutex(app);
+        language = buffer_get_language(app, buffer_id);
+        release_global_frame_mutex(app);
+    }
+    
+    if (language != BufferLanguage_Cpp){
+        ProfileBlock(app, "async lex non-cpp");
+        list = lex_full_input_for_language(scratch, language, contents);
+        canceled = async_check_canceled(actx);
+    }
+    else{
+        Lex_State_Cpp state = {};
+        lex_full_input_cpp_init(&state, contents);
+        for (;;){
+            ProfileBlock(app, "async lex block");
+            if (lex_full_input_cpp_breaks(scratch, &list, &state, limit_factor)){
+                break;
+            }
+            if (async_check_canceled(actx)){
+                canceled = true;
+                break;
+            }
         }
     }
     
@@ -735,8 +762,13 @@ BUFFER_HOOK_SIG(default_begin_buffer){
     Scratch_Block scratch(app);
     
     b32 treat_as_code = false;
+    Buffer_Language language = BufferLanguage_Cpp;
     String_Const_u8 file_name = push_buffer_file_name(app, scratch, buffer_id);
     if (file_name.size > 0){
+        language = buffer_language_from_file_name(file_name);
+        if (language != BufferLanguage_Cpp){
+            treat_as_code = true;
+        }
         String_Const_u8 treat_as_code_string = def_get_config_string(scratch, vars_save_string_lit("treat_as_code"));
         String_Const_u8_Array extensions = parse_extension_line_to_extension_list(app, scratch, treat_as_code_string);
         String_Const_u8 ext = string_file_extension(file_name);
@@ -816,6 +848,9 @@ BUFFER_HOOK_SIG(default_begin_buffer){
     Command_Map_ID *map_id_ptr = scope_attachment(app, scope, buffer_map_id, Command_Map_ID);
     *map_id_ptr = map_id;
     
+    Buffer_Language *language_ptr = scope_attachment(app, scope, buffer_language, Buffer_Language);
+    *language_ptr = language;
+    
     Line_Ending_Kind setting = guess_line_ending_kind_from_buffer(app, buffer_id);
     Line_Ending_Kind *eol_setting = scope_attachment(app, scope, buffer_eol_setting, Line_Ending_Kind);
     *eol_setting = setting;
@@ -844,7 +879,10 @@ BUFFER_HOOK_SIG(default_begin_buffer){
         *wrap_lines_ptr = wrap_lines;
     }
     
-    if (use_lexer){
+    if (use_lexer && language != BufferLanguage_Cpp){
+        buffer_set_layout(app, buffer_id, layout_generic);
+    }
+    else if (use_lexer){
         buffer_set_layout(app, buffer_id, layout_virt_indent_index_generic);
     }
     else{
@@ -919,7 +957,8 @@ BUFFER_HOOK_SIG(default_file_save){
     
     b32 auto_indent = def_get_config_b32(vars_save_string_lit("automatically_indent_text_on_save"));
     b32 is_virtual = def_get_config_b32(vars_save_string_lit("enable_virtual_whitespace"));
-    if (auto_indent && is_virtual){
+    if (auto_indent && is_virtual &&
+        buffer_get_language(app, buffer_id) == BufferLanguage_Cpp){
         auto_indent_buffer(app, buffer_id, buffer_range(app, buffer_id));
     }
     
@@ -994,7 +1033,8 @@ BUFFER_EDIT_RANGE_SIG(default_buffer_edit_range){
             Range_i64 relex_range = Ii64(token_first->pos, token_resync->pos + token_resync->size + text_shift);
             String_Const_u8 partial_text = push_buffer_range(app, scratch, buffer_id, relex_range);
             
-            Token_List relex_list = lex_full_input_cpp(scratch, partial_text);
+            Buffer_Language language = buffer_get_language(app, buffer_id);
+            Token_List relex_list = lex_full_input_for_language(scratch, language, partial_text);
             if (relex_range.one_past_last < buffer_get_size(app, buffer_id)){
                 token_drop_eof(&relex_list);
             }

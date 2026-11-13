@@ -54,6 +54,7 @@ buffer_map_id = managed_id_declare(app, string_u8_litexpr("attachment"), string_
 buffer_eol_setting = managed_id_declare(app, string_u8_litexpr("attachment"), string_u8_litexpr("buffer_eol_setting"));
 buffer_lex_task = managed_id_declare(app, string_u8_litexpr("attachment"), string_u8_litexpr("buffer_lex_task"));
 buffer_wrap_lines = managed_id_declare(app, string_u8_litexpr("attachment"), string_u8_litexpr("buffer_wrap_lines"));
+buffer_language = managed_id_declare(app, string_u8_litexpr("attachment"), string_u8_litexpr("buffer_language"));
 sticky_jump_marker_handle = managed_id_declare(app, string_u8_litexpr("attachment"), string_u8_litexpr("sticky_jump_marker_handle"));
 attachment_tokens = managed_id_declare(app, string_u8_litexpr("attachment"), string_u8_litexpr("attachment_tokens"));
 }

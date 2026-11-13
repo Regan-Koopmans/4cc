@@ -143,6 +143,9 @@ indent__unfinished_statement(Token *token, Nest *current_nest){
         if (HasFlag(token->flags, TokenBaseFlag_PreprocessorBody)){
             result = false;
         }
+        if (HasFlag(token->flags, TokenBaseFlag_StatementEnd)){
+            result = false;
+        }
     }
     return(result);
 }
@@ -173,6 +176,10 @@ get_indentation_array(Application_Links *app, Arena *arena, Buffer_ID buffer, Ra
     
     Token_Array token_array = get_token_array_from_buffer(app, buffer);
     Token_Array *tokens = &token_array;
+    
+    // NOTE: gofmt indents paren continuations by one level instead of
+    // aligning to the open paren, and puts the closer at the outer level.
+    b32 go_style = (buffer_get_language(app, buffer) == BufferLanguage_Go);
     
     i64 anchor_line = clamp_bot(1, lines.first - 1);
     Token *anchor_token = find_anchor_token(app, buffer, tokens, anchor_line);
@@ -255,7 +262,12 @@ get_indentation_array(Application_Links *app, Arena *arena, Buffer_ID buffer, Ra
                         sll_stack_push(nest, new_nest);
                         nest->kind = TokenBaseKind_ParentheticalOpen;
                         line_indent_cache_update(app, buffer, tab_width, &line_cache);
-                        nest->indent = (token->pos - line_cache.indent_info.first_char_pos) + 1;
+                        if (go_style){
+                            nest->indent = indent_width;
+                        }
+                        else{
+                            nest->indent = (token->pos - line_cache.indent_info.first_char_pos) + 1;
+                        }
                         following_indent = nest->indent;
                         shift_by_actual_indent = true;
                         ignore_unfinished_statement = true;
@@ -272,6 +284,9 @@ get_indentation_array(Application_Links *app, Arena *arena, Buffer_ID buffer, Ra
                         if (nest != 0){
                             following_indent = nest->indent;
                         }
+                        if (go_style){
+                            this_indent = following_indent;
+                        }
                         //ignore_unfinished_statement = true;
                     }break;
                 }
@@ -283,6 +298,10 @@ get_indentation_array(Application_Links *app, Arena *arena, Buffer_ID buffer, Ra
                 
                 if (in_unfinished_statement && !ignore_unfinished_statement){
                     this_indent += indent_width;
+                }
+                
+                if (HasFlag(token->flags, TokenBaseFlag_OutdentLabel)){
+                    this_indent = clamp_bot(0, this_indent - indent_width);
                 }
             }
             
@@ -354,6 +373,9 @@ actual_indent = N; )
 internal b32
 auto_indent_buffer(Application_Links *app, Buffer_ID buffer, Range_i64 pos, Indent_Flag flags, i32 tab_width, i32 indent_width){
     ProfileScope(app, "auto indent buffer");
+    if (language_uses_line_indent(buffer_get_language(app, buffer))){
+        return(false);
+    }
     Token_Array token_array = get_token_array_from_buffer(app, buffer);
     Token_Array *tokens = &token_array;
     
@@ -395,7 +417,7 @@ auto_indent_buffer(Application_Links *app, Buffer_ID buffer, Range_i64 pos, Inde
     tab_width = clamp_bot(1, tab_width);
     AddFlag(flags, Indent_FullTokens);
     b32 indent_with_tabs = def_get_config_b32(vars_save_string_lit("indent_with_tabs"));
-    if (indent_with_tabs){
+    if (indent_with_tabs || buffer_get_language(app, buffer) == BufferLanguage_Go){
         AddFlag(flags, Indent_UseTab);
     }
     b32 clear_blank_lines = def_get_config_b32(vars_save_string_lit("indent_clear_blank_lines"));
@@ -441,12 +463,218 @@ CUSTOM_DOC("Auto-indents the range between the cursor and the mark.")
     move_past_lead_whitespace(app, view, buffer);
 }
 
+// NOTE: Python indentation is significant. Instead of reindenting, carry
+// the current line's indent onto a new line, add a level after ':', and
+// drop a level after a block-ending statement.
+function b32
+python_line_starts_with_word(String_Const_u8 line, char *word){
+    String_Const_u8 w = SCu8(word);
+    b32 result = false;
+    if (line.size >= w.size && string_match(string_prefix(line, w.size), w)){
+        result = (line.size == w.size || !character_is_alpha_numeric(line.str[w.size]));
+    }
+    return(result);
+}
+
+function void
+python_write_text_and_indent(Application_Links *app, View_ID view, Buffer_ID buffer, String_Const_u8 insert){
+    if (!(insert.size == 1 && insert.str[0] == '\n') || view_has_highlighted_range(app, view)){
+        write_text_input(app);
+        return;
+    }
+    
+    Scratch_Block scratch(app);
+    Buffer_Language language = buffer_get_language(app, buffer);
+    i32 indent_width = (i32)def_get_config_u64(app, vars_save_string_lit("indent_width"));
+    i32 tab_width = (i32)def_get_config_u64(app, vars_save_string_lit("default_tab_width"));
+    tab_width = clamp_bot(1, tab_width);
+    if (indent_width <= 0){
+        indent_width = 4;
+    }
+    b32 indent_with_tabs = def_get_config_b32(vars_save_string_lit("indent_with_tabs"));
+    if (language == BufferLanguage_Yaml){
+        // NOTE: YAML forbids tabs; two spaces is the common convention.
+        indent_width = 2;
+        indent_with_tabs = false;
+    }
+    
+    i64 cursor = view_get_cursor_pos(app, view);
+    i64 line_number = get_line_number_from_pos(app, buffer, cursor);
+    i64 line_start = get_line_start_pos(app, buffer, line_number);
+    String_Const_u8 before = push_buffer_range(app, scratch, buffer, Ii64(line_start, cursor));
+    
+    // Measure current indent.
+    i64 indent = 0;
+    u64 lead = 0;
+    for (; lead < before.size; lead += 1){
+        u8 c = before.str[lead];
+        if (c == ' '){
+            indent += 1;
+        }
+        else if (c == '\t'){
+            indent += tab_width - (indent % tab_width);
+        }
+        else{
+            break;
+        }
+    }
+    
+    // Strip a trailing comment and whitespace from the code before the cursor.
+    String_Const_u8 code = string_skip(before, lead);
+    
+    // NOTE: Text inserted after the newline and indent (list continuation).
+    String_Const_u8 continuation = {};
+    
+    if (language == BufferLanguage_Markdown){
+        // Continue list items and block quotes; an empty item ends the list.
+        String_Const_u8 marker = {};
+        if (code.size >= 2 && (code.str[0] == '-' || code.str[0] == '*' || code.str[0] == '+') &&
+            code.str[1] == ' '){
+            marker = string_prefix(code, 2);
+            // Task list item.
+            if (code.size >= 6 && code.str[2] == '[' && code.str[4] == ']' && code.str[5] == ' '){
+                marker = push_u8_stringf(scratch, "%c [ ] ", code.str[0]);
+            }
+        }
+        else if (code.size >= 2 && code.str[0] == '>'){
+            marker = string_u8_litexpr("> ");
+        }
+        else{
+            u64 k = 0;
+            for (;k < code.size && character_is_base10(code.str[k]);){
+                k += 1;
+            }
+            if (k > 0 && k + 1 < code.size && (code.str[k] == '.' || code.str[k] == ')') &&
+                code.str[k + 1] == ' '){
+                u64 n = 0;
+                for (u64 m = 0; m < k; m += 1){
+                    n = n*10 + (code.str[m] - '0');
+                }
+                marker = push_u8_stringf(scratch, "%llu%c ", (unsigned long long)(n + 1), code.str[k]);
+            }
+        }
+        if (marker.size > 0){
+            String_Const_u8 rest = string_skip_chop_whitespace(code);
+            b32 empty_item = (rest.size <= string_skip_chop_whitespace(marker).size);
+            if (empty_item){
+                // Remove the dangling marker and stop the list.
+                buffer_replace_range(app, buffer, Ii64(line_start + lead, cursor), string_u8_empty);
+                return;
+            }
+            continuation = marker;
+        }
+    }
+    else if (language == BufferLanguage_Yaml){
+        String_Const_u8 trimmed = string_skip_chop_whitespace(code);
+        // "- " items: new line aligns with the item content when it is a mapping.
+        if (trimmed.size >= 2 && trimmed.str[0] == '-' && trimmed.str[1] == ' '){
+            String_Const_u8 rest = string_skip_chop_whitespace(string_skip(trimmed, 2));
+            if (rest.size > 0 && rest.str[rest.size - 1] == ':'){
+                indent += 2 + indent_width;
+            }
+            else if (rest.size > 0){
+                // Sibling mapping key under the same item, or another item.
+                b32 has_key = false;
+                for (u64 k = 0; k + 1 < rest.size; k += 1){
+                    if (rest.str[k] == ':' && rest.str[k + 1] == ' '){
+                        has_key = true;
+                        break;
+                    }
+                }
+                if (has_key){
+                    indent += 2;
+                }
+                else{
+                    continuation = string_u8_litexpr("- ");
+                }
+            }
+        }
+        else if (trimmed.size > 0 &&
+                 (trimmed.str[trimmed.size - 1] == ':' ||
+                  trimmed.str[trimmed.size - 1] == '|' ||
+                  trimmed.str[trimmed.size - 1] == '>' ||
+                  (trimmed.size >= 2 && trimmed.str[trimmed.size - 2] == '|') ||
+                  (trimmed.size >= 2 && trimmed.str[trimmed.size - 2] == '>'))){
+            indent += indent_width;
+        }
+    }
+    
+    if (language != BufferLanguage_Python){
+        // Markdown, YAML, TOML: no python keyword rules.
+        code = string_u8_empty;
+    }
+    {
+        u8 quote = 0;
+        for (u64 i = 0; i < code.size; i += 1){
+            u8 c = code.str[i];
+            if (quote != 0){
+                if (c == '\\'){
+                    i += 1;
+                }
+                else if (c == quote){
+                    quote = 0;
+                }
+            }
+            else if (c == '\'' || c == '"'){
+                quote = c;
+            }
+            else if (c == '#'){
+                code.size = i;
+                break;
+            }
+        }
+    }
+    code = string_skip_chop_whitespace(code);
+    
+    if (code.size > 0 && code.str[code.size - 1] == ':'){
+        indent += indent_width;
+    }
+    else if (python_line_starts_with_word(code, "return") ||
+             python_line_starts_with_word(code, "pass") ||
+             python_line_starts_with_word(code, "break") ||
+             python_line_starts_with_word(code, "continue") ||
+             python_line_starts_with_word(code, "raise")){
+        indent = clamp_bot(0, indent - indent_width);
+    }
+    
+    List_String_Const_u8 parts = {};
+    string_list_push(scratch, &parts, string_u8_litexpr("\n"));
+    if (indent_with_tabs){
+        i64 tabs = indent/tab_width;
+        i64 spaces = indent - tabs*tab_width;
+        for (i64 i = 0; i < tabs; i += 1){
+            string_list_push(scratch, &parts, string_u8_litexpr("\t"));
+        }
+        for (i64 i = 0; i < spaces; i += 1){
+            string_list_push(scratch, &parts, string_u8_litexpr(" "));
+        }
+    }
+    else{
+        for (i64 i = 0; i < indent; i += 1){
+            string_list_push(scratch, &parts, string_u8_litexpr(" "));
+        }
+    }
+    if (continuation.size > 0){
+        string_list_push(scratch, &parts, continuation);
+    }
+    String_Const_u8 text = string_list_flatten(scratch, parts);
+    write_text(app, text);
+}
+
 CUSTOM_COMMAND_SIG(write_text_and_auto_indent)
 CUSTOM_DOC("Inserts text and auto-indents the line on which the cursor sits if any of the text contains 'layout punctuation' such as ;:{}()[]# and new lines.")
 {
     ProfileScope(app, "write and auto indent");
     User_Input in = get_current_input(app);
     String_Const_u8 insert = to_writable(&in);
+    {
+        View_ID view = get_active_view(app, Access_ReadWriteVisible);
+        Buffer_ID buffer = view_get_buffer(app, view, Access_ReadWriteVisible);
+        if (buffer != 0 && language_uses_line_indent(buffer_get_language(app, buffer))){
+            python_write_text_and_indent(app, view, buffer, insert);
+            return;
+        }
+    }
     if (insert.str != 0 && insert.size > 0){
         b32 do_auto_indent = false;
         for (u64 i = 0; !do_auto_indent && i < insert.size; i += 1){

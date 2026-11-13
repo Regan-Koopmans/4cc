@@ -3,7 +3,8 @@
 #include <stdio.h>
 
 #define FPS 60
-#define frame_useconds (1000000 / FPS)
+static unsigned long long mac_frame_useconds = (1000000 / FPS);
+#define frame_useconds mac_frame_useconds
 
 #include "4coder_base_types.h"
 #include "4coder_version.h"
@@ -98,6 +99,7 @@ struct Mac_Input_Chunk_Transient{
     b8 mouse_r_release;
     b8 out_of_window;
     b8 trying_to_kill;
+    b8 mouse_wheel_precise;
     i32 mouse_wheel;
 };
 
@@ -208,6 +210,7 @@ struct Mac_Vars {
     NSWindow *window;
     FCoder_View *view;
     f32 screen_scale_factor;
+    f32 scroll_remainder;
 
     mach_timebase_info_data_t timebase_info;
     b32 first;
@@ -750,6 +753,7 @@ mac_toggle_fullscreen(void){
             input.mouse.release_r = input_chunk.trans.mouse_r_release;
 
             input.mouse.wheel = input_chunk.trans.mouse_wheel;
+            input.mouse.wheel_precise = input_chunk.trans.mouse_wheel_precise;
             input.mouse.p = input_chunk.pers.mouse;
 
             input.trying_to_kill = input_chunk.trans.trying_to_kill;
@@ -1104,17 +1108,34 @@ Input_Event *event = push_input_event(&mac_vars.frame_arena, &mac_vars.input_chu
 
 - (void)scrollWheel:(NSEvent *)event{
     f32 dy = event.scrollingDeltaY;
+    f32 pixels = 0.f;
+    mac_vars.input_chunk.trans.mouse_wheel_precise = [event hasPreciseScrollingDeltas];
     if ([event hasPreciseScrollingDeltas]){
-        mac_vars.input_chunk.trans.mouse_wheel = (i32)(-dy);
+        // NOTE: Trackpad and Magic Mouse deltas are in points and already
+        // carry system acceleration and momentum. Convert to backing pixels.
+        f32 backing_scale = (f32)[[self window] backingScaleFactor];
+        if (backing_scale <= 0.f){
+            backing_scale = 1.f;
+        }
+        pixels = -dy*backing_scale;
     }
     else{
-        if (dy > 0){
-            mac_vars.input_chunk.trans.mouse_wheel = -100;
+        // NOTE: Line-based wheel. scrollingDeltaY is in lines and may be
+        // accelerated; scale by a nominal line height in pixels.
+        f32 backing_scale = (f32)[[self window] backingScaleFactor];
+        if (backing_scale <= 0.f){
+            backing_scale = 1.f;
         }
-        else{
-            mac_vars.input_chunk.trans.mouse_wheel = 100;
-        }
+        pixels = -dy*40.f*backing_scale;
     }
+    
+    // NOTE: Accumulate. Several events can arrive between frames; keep the
+    // fractional part so slow scrolling is not lost to truncation.
+    f32 total = mac_vars.scroll_remainder + pixels;
+    i32 whole = (i32)total;
+    mac_vars.scroll_remainder = total - (f32)whole;
+    mac_vars.input_chunk.trans.mouse_wheel += whole;
+    
     system_signal_step(0);
 }
 
@@ -1292,6 +1313,14 @@ main(int arg_count, char **args){
             NSSize size = [[desc valueForKey:NSDeviceResolution] sizeValue];
             f32 max_dpi = Max(size.width, size.height);
             mac_vars.screen_scale_factor = (max_dpi / 72.0f);
+            
+            // NOTE: Run at the display's refresh rate.
+            if ([screen respondsToSelector:@selector(maximumFramesPerSecond)]){
+                NSInteger fps = [screen maximumFramesPerSecond];
+                if (fps >= 30 && fps <= 240){
+                    mac_frame_useconds = (1000000 / (unsigned long long)fps);
+                }
+            }
         }
 
         // NOTE(yuval): Load core

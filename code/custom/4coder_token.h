@@ -51,6 +51,22 @@ char *token_base_kind_names[] ={
 typedef u16 Token_Base_Flag;
 enum{
     TokenBaseFlag_PreprocessorBody = 1,
+    // NOTE: Set by lexers for languages without statement terminators
+    // (e.g. Go) on the last token of a complete statement.
+    TokenBaseFlag_StatementEnd = 2,
+    // NOTE: Line starting with this token sits one level left of its scope
+    // (e.g. Go "case" and "default" labels, per gofmt).
+    TokenBaseFlag_OutdentLabel = 4,
+};
+
+typedef i32 Buffer_Language;
+enum{
+    BufferLanguage_Cpp = 0,
+    BufferLanguage_Python = 1,
+    BufferLanguage_Go = 2,
+    BufferLanguage_Markdown = 3,
+    BufferLanguage_Yaml = 4,
+    BufferLanguage_Toml = 5,
 };
 
 struct Token{

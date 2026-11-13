@@ -110,12 +110,18 @@ get_start_of_line_at_cursor(Application_Links *app, View_ID view, Buffer_ID buff
     return(get_pos_past_lead_whitespace_from_line_number(app, buffer, line));
 }
 
+function String_Const_u8
+line_comment_token_for_buffer(Application_Links *app, Buffer_ID buffer){
+    return(language_line_comment(buffer_get_language(app, buffer)));
+}
+
 function b32
 c_line_comment_starts_at_position(Application_Links *app, Buffer_ID buffer, i64 pos){
     b32 alread_has_comment = false;
+    String_Const_u8 token = line_comment_token_for_buffer(app, buffer);
     u8 check_buffer[2];
-    if (buffer_read_range(app, buffer, Ii64(pos, pos + 2), check_buffer)){
-        if (check_buffer[0] == '/' && check_buffer[1] == '/'){
+    if (buffer_read_range(app, buffer, Ii64(pos, pos + token.size), check_buffer)){
+        if (block_match(check_buffer, token.str, token.size)){
             alread_has_comment = true;
         }
     }
@@ -130,7 +136,7 @@ CUSTOM_DOC("Insert '//' at the beginning of the line after leading whitespace.")
     i64 pos = get_start_of_line_at_cursor(app, view, buffer);
     b32 alread_has_comment = c_line_comment_starts_at_position(app, buffer, pos);
     if (!alread_has_comment){
-        buffer_replace_range(app, buffer, Ii64(pos), string_u8_litexpr("//"));
+        buffer_replace_range(app, buffer, Ii64(pos), line_comment_token_for_buffer(app, buffer));
     }
 }
 
@@ -142,7 +148,7 @@ CUSTOM_DOC("If present, delete '//' at the beginning of the line after leading w
     i64 pos = get_start_of_line_at_cursor(app, view, buffer);
     b32 alread_has_comment = c_line_comment_starts_at_position(app, buffer, pos);
     if (alread_has_comment){
-        buffer_replace_range(app, buffer, Ii64(pos, pos + 2), string_u8_empty);
+        buffer_replace_range(app, buffer, Ii64(pos, pos + line_comment_token_for_buffer(app, buffer).size), string_u8_empty);
     }
 }
 
@@ -154,10 +160,10 @@ CUSTOM_DOC("Turns uncommented lines into commented lines and vice versa for comm
     i64 pos = get_start_of_line_at_cursor(app, view, buffer);
     b32 alread_has_comment = c_line_comment_starts_at_position(app, buffer, pos);
     if (alread_has_comment){
-        buffer_replace_range(app, buffer, Ii64(pos, pos + 2), string_u8_empty);
+        buffer_replace_range(app, buffer, Ii64(pos, pos + line_comment_token_for_buffer(app, buffer).size), string_u8_empty);
     }
     else{
-        buffer_replace_range(app, buffer, Ii64(pos), string_u8_litexpr("//"));
+        buffer_replace_range(app, buffer, Ii64(pos), line_comment_token_for_buffer(app, buffer));
     }
 }
 

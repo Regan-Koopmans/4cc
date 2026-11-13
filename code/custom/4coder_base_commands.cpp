@@ -273,6 +273,11 @@ CUSTOM_DOC("Reads the scroll wheel value from the mouse state and scrolls accord
     if (mouse.wheel != 0){
         Buffer_Scroll scroll = view_get_buffer_scroll(app, view);
         scroll.target = view_move_buffer_point(app, view, scroll.target, V2f32(0.f, (f32)mouse.wheel));
+        if (mouse.wheel_precise){
+            // NOTE: Trackpad input already has momentum. Track it 1:1
+            // instead of easing toward the target.
+            scroll.position = scroll.target;
+        }
         view_set_buffer_scroll(app, view, scroll, SetBufferScroll_SnapCursorIntoView);
     }
     if (mouse.l){

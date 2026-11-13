@@ -773,6 +773,53 @@ else if (token->kind == TokenBaseKind_ParentheticalOpen){
 Code_Index_Nest *nest = generic_parse_paren(index, state);
 code_index_push_nest(&index->nest_list, nest);
 }
+else if (state->do_python_parse &&
+         (token->kind == TokenBaseKind_Keyword || token->sub_kind == TokenCppKind_Class)){
+String_Const_u8 lexeme = string_substring(state->contents, Ii64(token));
+b32 is_def = string_match(lexeme, string_u8_litexpr("def"));
+b32 is_class = string_match(lexeme, string_u8_litexpr("class"));
+generic_parse_inc(state);
+if (is_def || is_class){
+generic_parse_skip_soft_tokens(index, state);
+Token *name = token_it_read(&state->it);
+if (name != 0 && !state->finished && name->kind == TokenBaseKind_Identifier){
+index_new_note(index, state, Ii64(name), is_def?CodeIndexNote_Function:CodeIndexNote_Type, 0);
+}
+}
+}
+else if (state->do_go_parse &&
+         (token->sub_kind == TokenCppKind_KeywordGeneric || token->sub_kind == TokenCppKind_Typedef)){
+String_Const_u8 lexeme = string_substring(state->contents, Ii64(token));
+b32 is_func = string_match(lexeme, string_u8_litexpr("func"));
+b32 is_type = (token->sub_kind == TokenCppKind_Typedef);
+generic_parse_inc(state);
+if (is_func || is_type){
+generic_parse_skip_soft_tokens(index, state);
+Token *name = token_it_read(&state->it);
+if (is_func && name != 0 && !state->finished && name->kind == TokenBaseKind_ParentheticalOpen){
+// NOTE: Method receiver. Skip "(...)" to reach the name.
+i32 depth = 0;
+for (;name != 0 && !state->finished;){
+if (name->kind == TokenBaseKind_ParentheticalOpen){
+depth += 1;
+}
+else if (name->kind == TokenBaseKind_ParentheticalClose){
+depth -= 1;
+}
+generic_parse_inc(state);
+if (depth <= 0){
+break;
+}
+name = token_it_read(&state->it);
+}
+generic_parse_skip_soft_tokens(index, state);
+name = token_it_read(&state->it);
+}
+if (name != 0 && !state->finished && name->kind == TokenBaseKind_Identifier){
+index_new_note(index, state, Ii64(name), is_func?CodeIndexNote_Function:CodeIndexNote_Type, 0);
+}
+}
+}
 else if (state->do_cpp_parse){
 if (token->sub_kind == TokenCppKind_Struct ||
     token->sub_kind == TokenCppKind_Union ||
